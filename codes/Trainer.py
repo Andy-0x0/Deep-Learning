@@ -1,4 +1,4 @@
-import datetime
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -24,124 +24,194 @@ batch_size:     int                             ->  the batch_size for training
 '''
 
 
+class EMA:
+    def __init__(self, history=24, bias=False, path='mtyProject/sscqxhdl_prediction/Models/'):
+        self.model = 0
+        self.decay = 1 - (1 / history)
+        self.bias = bias
+        self.path = path
+
+        self.counter = 0
+        self.shadow = {}
+        self.backup = {}
+
+    def register(self, model):
+        self.model = model
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.detach().clone()
+
+    def step(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                current_v = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data.detach().clone()
+
+                if self.bias:
+                    current_v /= 1 - self.decay ** self.counter
+                    self.counter += 1
+
+                self.shadow[name] = current_v.detach().clone()
+
+    def apply(self, device):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                self.backup[name] = param.data.clone()
+
+                temp = self.shadow[name]
+                temp = temp.to(device=torch.device(device))
+                param.data = temp.detach().clone()
+
+    def revert(self, device):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.backup
+
+                temp = self.backup[name]
+                temp = temp.to(device=torch.device(device))
+                param.data = temp.clone()
+        self.backup = {}
+
+    def store(self):
+        torch.save(self.shadow, self.path + 'New_Model_EMA_shadow.pth')
+        torch.save(self.backup, self.path + 'New_Model_EMA_backup.pth')
+
+    def load(self):
+        self.shadow = torch.load(self.path + 'New_Model_EMA_shadow.pth')
+        self.backup = torch.load(self.path + 'New_Model_EMA_backup.pth')
+
+
 class Trainer:
-    def __init__(self, loader_dict, train_dict, mode='none', path='fd_prediction/', name='New_Model.params', display='E'):
-        self.train_loader = loader_dict['train']
-        self.test_loader = loader_dict['test']
+    def __init__(self, train_dict, loader, EMA_config, mode='none', path='fd_prediction/', name='New_Model.params'):
 
         self.modelFunct = train_dict['model']
         self.optimizer = train_dict['optim']
         self.lossFunct = train_dict['loss']
         self.epochs = train_dict['epochs']
-        self.checkpoint = train_dict['checkpoint']
 
+        self.train_loader = loader
+        self.EMA = EMA(history=EMA_config[0], bias=EMA_config[1]) if EMA_config else False
         self.mode = mode
         self.path = path
         self.name = name
-        self.display = display
 
-    def _device_decide(self):
+        class Printer:
+            def __init__(self, epochs):
+                self.epochs = epochs
+
+                self.acc = 0
+                self.acc_inited = False
+                self.space = len(str(epochs))
+
+                self.loss_accumulator = 0
+                self.case_accumulator = 0
+                self.loss_collector = []
+
+            def _init_acc(self, loss_sample):
+                self.acc = len(str(f'{loss_sample.item():.3f}')) + 1
+
+            def update(self, loss_sample, data_sample):
+                if not self.acc_inited:
+                    self.acc_inited = True
+                    self._init_acc(loss_sample)
+                self.loss_accumulator += loss_sample.item()
+                self.case_accumulator += len(data_sample)
+
+            def summarize(self, epoch):
+                print(f'[Epoch]: {epoch + 1:{self.space}d}/{self.epochs} | ', end='')
+                print(f'[Loss]: {self.loss_accumulator / self.case_accumulator:{self.acc}.3f}')
+                self.loss_collector.append(self.loss_accumulator / self.case_accumulator)
+
+                self.loss_accumulator = 0
+                self.case_accumulator = 0
+
+            def get_loss(self):
+                return self.loss_collector
+
+        self.printer = Printer(self.epochs)
+
+    def _device(self):
         if torch.cuda.is_available():
             return torch.device('cuda')
         else:
             return torch.device('cpu')
 
+    def _construct_optimizer(self):
+        update_params = filter(lambda p: p.requires_grad, self.modelFunct.parameters())
+        optimizer_type = self.optimizer[0]
+        lr = self.optimizer[1]
+        if optimizer_type.lower() == 'adam':
+            self.optimizer = torch.optim.Adam(update_params, lr=lr)
+        elif optimizer_type.lower() == 'adagrad':
+            self.optimizer = torch.optim.Adagrad(update_params, lr=lr)
+        else:
+            self.optimizer = torch.optim.Adagrad(update_params, lr=lr)
+
     def train(self):
-        loss_collector_train = []
-        outer_loss = 0
-        outer_scaler = 0
-        acc_collector_test = []
-        self.modelFunct = self.modelFunct.to(self._device_decide())
+        self.modelFunct = self.modelFunct.to(self._device())
+        if self.EMA:
+            self.EMA.register(self.modelFunct)
+            if os.path.isfile(self.EMA.path + 'New_Model_EMA_shadow.pth'):
+                self.EMA.load()
         self.modelFunct.train()
+        self._construct_optimizer()
 
         for epoch in range(self.epochs):
-            if self.display == 'B':
-                print(f'[Epoch]: {epoch + 1}/{self.epochs} ================')
 
             for batch_idx, (x, label) in enumerate(self.train_loader):
                 self.optimizer.zero_grad()
+                label = label.to(self._device())
 
-                label = label.to(self._device_decide())
                 if type(x) is tuple or type(x) is list:
-                    x = map(lambda ele: ele.to(self._device_decide()), x)
-                    loss = self.lossFunct(self.modelFunct(* x), label)
+                    x = map(lambda ele: ele.to(self._device()), x)
+                    loss = self.lossFunct(self.modelFunct(*x), label)
                 else:
-                    x = x.to(self._device_decide())
+                    x = x.to(self._device())
                     loss = self.lossFunct(self.modelFunct(x), label)
 
                 loss.backward()
-
                 self.optimizer.step()
+                self.printer.update(loss, label)
 
-                if self.display == 'E':
-                    outer_loss += loss.item()
-                    outer_scaler += len(label)
-                else:
-                    if (batch_idx + 1) % self.checkpoint == 0:
-                        print(f'\t[Batch]: {batch_idx + 1} | [Loss]: {loss.item():.3f}')
-                        loss_collector_train.append(loss.item())
+            if self.EMA: self.EMA.step()
+            self.printer.summarize(epoch)
 
-            if self.display == 'E':
-                print(f'[Epoch]: {epoch + 1}/{self.epochs} | ', end='')
-                print(f'[Loss]: {outer_loss / outer_scaler:.3f}')
-                loss_collector_train.append(outer_loss / outer_scaler)
-                outer_loss, outer_scaler = 0, 0
-            else:
-                print()
-
-            if self.mode == 'classification':
-                acc = self._test_on_test_classification()
-                acc_collector_test.append(acc)
-
-        loss_df = pd.Series(loss_collector_train, index=np.arange(1, len(loss_collector_train) + 1), name='Loss')
+        loss_df = pd.Series(self.printer.get_loss(), index=np.arange(1, len(self.printer.get_loss()) + 1), name='Loss')
         loss_df.plot(kind='line',
                      figsize=(16, 9),
                      lw=0.9,
                      xlabel='Epochs (Batches)',
                      ylabel='Loss Values',
                      title='Training Summary',
-                     color='red',
-                     )
+                     color='red')
         plt.show()
+        plt.savefig('mtyProject/loss/loss.png')
         plt.close()
+
+        if self.EMA: self.EMA.apply('cuda')
+        if self.EMA: self.EMA.store()
+
         torch.save(self.modelFunct.state_dict(), self.path + self.name)
 
-        if self.mode == 'classification':
-            plt.plot(np.linspace(1, len(loss_collector_train), self.epochs), acc_collector_test, color='blue',
-                     label='Acc on Test')
-            plt.show()
-            plt.close()
-        elif self.mode == 'regression':
+        if self.mode == 'regression':
             self._test_on_test_regression(200)
 
         print('>>>[Trainer]: Done!')
         return self.modelFunct, self.path + self.name
 
-    def _test_on_test_classification(self):
-        correct = 0
-        total = 0
-        for idx, (data, label) in enumerate(self.test_loader):
-            data = data.to(device=self._device_decide())
-            label = label.to(device=self._device_decide())
-            pred_label = self.modelFunct(data)
-
-            correct += (pred_label.argmax(dim=1) == label).sum(axis=0).to(device=torch.device('cpu'))
-            total += label.numel()
-
-        print(f'\t[Accuracy]  {100 * (correct / total):.2f}%')
-        return correct / total
-
     def _test_on_test_regression(self, clip=200):
         pred_collector = []
         label_collector = []
         self.modelFunct = self.modelFunct.to(device=torch.device('cpu'))
+        if self.EMA: self.EMA.apply(device='cpu')
         self.modelFunct.eval()
 
         for idx, (data, label) in enumerate(self.train_loader):
             label = label.to(device=torch.device('cpu'))
             if type(data) is tuple or type(data) is list:
                 data = map(lambda ele: ele.to(device=torch.device('cpu')), data)
-                pred_label = self.modelFunct(* data)
+                pred_label = self.modelFunct(*data)
             else:
                 data = data.to(device=torch.device('cpu'))
                 pred_label = self.modelFunct(data)
@@ -156,11 +226,10 @@ class Trainer:
             pred_collector.extend(chip_p)
             label_collector.extend(chip_l)
 
-        if clip > 0:
-            res = pd.DataFrame({'Prediction': pred_collector, 'Label': label_collector})
-            res = res.iloc[:min(clip, len(res)), :]
-        else:
-            res = pd.DataFrame({'Prediction': pred_collector, 'Label': label_collector})
+            if clip >= 0 and len(label_collector) >= clip:
+                break
+
+        res = pd.DataFrame({'Prediction': pred_collector, 'Label': label_collector})
 
         res.plot(kind='line',
                  figsize=(16, 9),
@@ -171,58 +240,52 @@ class Trainer:
                  title='Fit on Training Data',
                  color=('red', 'blue'))
         plt.show()
+        plt.savefig('mtyProject/loss/train.png')
         plt.close()
+
+        if self.EMA: self.EMA.revert(device='cpu')
 
 
 class Trainer2F:
-    def __init__(self, loader_config, f1_config, f2_config, mode='single', path='fd_prediction/', name='New_Model.params', display='E'):
-        self.train_loader = loader_config['train']
-        self.test_loader = loader_config['test']
+    def __init__(self, f1_config, f2_config, loader, EMA_config, mode='single', path='fd_prediction/',
+                 name='New_Model.params'):
 
         self.F1_modelFunct = f1_config['model']
         self.F1_optimizer = f1_config['optim']
         self.F1_lossFunct = f1_config['loss']
         self.F1_epochs = f1_config['epochs']
-        self.F1_checkpoint = f1_config['checkpoint']
 
         self.F2_modelFunct = f2_config['model']
         self.F2_optimizer = f2_config['optim']
         self.F2_lossFunct = f2_config['loss']
         self.F2_epochs = f2_config['epochs']
-        self.F2_checkpoint = f2_config['checkpoint']
 
+        self.loader = loader
+        self.EMA_config = EMA_config
         self.mode = mode
         self.path = path
         self.name = name
-        self.display = display
 
     def train(self):
-        update_params = self.F1_modelFunct.parameters()
-        optimizer_type = self.F1_optimizer[0]
-        lr = self.F1_optimizer[1]
-        if optimizer_type.lower() == 'adam':
-            self.F1_optimizer = torch.optim.Adam(update_params, lr=lr)
-        elif optimizer_type.lower() == 'adagrad':
-            self.F1_optimizer = torch.optim.Adagrad(update_params, lr=lr)
-        else:
-            self.F1_optimizer = torch.optim.Adagrad(update_params, lr=lr)
+        if self.EMA_config:
+            pre_EMA_file = [self.path + 'New_Model_EMA_shadow.pth', self.path + 'New_Model_EMA_backup.pth']
+            if os.path.isfile(pre_EMA_file[0]):
+                os.remove(pre_EMA_file[0])
+            if os.path.isfile(pre_EMA_file[1]):
+                os.remove(pre_EMA_file[1])
 
-        trainer_f1 = Trainer({
-            'train': self.train_loader,
-            'test': self.test_loader
-        },
-        {
+        trainer = Trainer({
             'model': self.F1_modelFunct,
             'loss': self.F1_lossFunct,
             'optim': self.F1_optimizer,
             'epochs': self.F1_epochs,
-            'checkpoint': self.F1_checkpoint,
         },
-        mode=self.mode,
-        path=self.path,
-        name=self.name,
-        display=self.display)
-        _, state_dict_path = trainer_f1.train()
+            loader=self.loader,
+            EMA_config=self.EMA_config,
+            mode=self.mode,
+            path=self.path,
+            name=self.name)
+        _, state_dict_path = trainer.train()
         print('>>>[Trainer]: Model Face1 Done!')
 
         self.F2_modelFunct.load_state_dict(torch.load(state_dict_path))
@@ -230,38 +293,19 @@ class Trainer2F:
             if 'F1' in name:
                 param.requires_grad = False
 
-        update_params = filter(lambda p: p.requires_grad, self.F2_modelFunct.parameters())
-        optimizer_type = self.F2_optimizer[0]
-        lr = self.F2_optimizer[1]
-        if optimizer_type.lower() == 'adam':
-            self.F2_optimizer = torch.optim.Adam(update_params, lr=lr)
-        elif optimizer_type.lower() == 'adagrad':
-            self.F2_optimizer = torch.optim.Adagrad(update_params, lr=lr)
-        else:
-            self.F2_optimizer = torch.optim.Adagrad(update_params, lr=lr)
-
         trainer = Trainer({
-            'train': self.train_loader,
-            'test': self.test_loader
-        },
-        {
             'model': self.F2_modelFunct,
             'loss': self.F2_lossFunct,
             'optim': self.F2_optimizer,
             'epochs': self.F2_epochs,
-            'checkpoint': self.F2_checkpoint,
         },
-        mode=self.mode,
-        path=self.path,
-        name=self.name,
-        display=self.display)
+            loader=self.loader,
+            EMA_config=self.EMA_config,
+            mode=self.mode,
+            path=self.path,
+            name=self.name)
         model_prototype, state_dict_path = trainer.train()
         print('>>>[Trainer]: Model Face2 Done!')
 
         return model_prototype, state_dict_path
-
-
-
-
-
 
