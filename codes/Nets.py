@@ -4,10 +4,12 @@ import numpy as np
 import math
 
 import torch
-import torch.nn
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Sequential
-import torch.nn.modules as mods
+
+from torchvision.models.resnet import ResNet as PResNet
+from torchvision.models.resnet import BasicBlock, Bottleneck
 
 
 # Global Seed Initialization ===========================================================================================
@@ -60,7 +62,7 @@ class LeNet(torch.nn.Module):
     def __init__(self, in_channel, out_channel, dropout=0.1):
         super(LeNet, self).__init__()
 
-        self.Conv1 = torch.nn.Conv2d(in_channel, in_channel * 8, padding=2, kernel_size=5)
+        self.Conv1 = torch.nn.Conv2d(in_channel, in_channel * 8, padding=2, kernel_size=3)
         self.MaxPool1 = torch.nn.MaxPool2d(kernel_size=2, stride=2)
 
         self.Conv2 = torch.nn.Conv2d(in_channel * 8, in_channel * 16, kernel_size=5)
@@ -68,7 +70,7 @@ class LeNet(torch.nn.Module):
 
         self.Flatten = torch.nn.Flatten()
 
-        self.COMPRESS_L1 = 240
+        self.COMPRESS_L1 = 768
         self.COMPRESS_L2 = 120
         self.COMPRESS_L3 = 84
 
@@ -354,111 +356,85 @@ class GoogLeNet(torch.nn.Module):
 
 
 # ResNet ===============================================================================================================
-class _ResBlock(torch.nn.Module):
-    def __init__(self, in_channel, out_channel, sub=False, norm='bn'):
-        super(_ResBlock, self).__init__()
-        self.conv1 = torch.nn.Conv2d(in_channel, out_channel, kernel_size=3, padding=1, stride=1 + int(sub))
-        self.conv2 = torch.nn.Conv2d(out_channel, out_channel, kernel_size=3, padding=1)
+class ResNet(PResNet):
+    def __init__(
+        self,
+        in_channel: int = 1,
+        num_classes: int = 2,
+        status: tuple = (18, False),
+        block: type[BasicBlock, Bottleneck] = BasicBlock,
+        layers: list[int] = (2, 2, 2, 2),
+        zero_init_residual: bool = False,
+        groups: int = 1,
+        width_per_group: int = 64,
+        replace_stride_with_dilation=None,
+        norm_layer=None,
+    ) -> None:
+        super().__init__(
+            block,
+            layers,
+            num_classes,
+            zero_init_residual,
+            groups,
+            width_per_group,
+            replace_stride_with_dilation,
+            norm_layer,
+        )
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        self._norm_layer = norm_layer
 
-        self.norm1 = _make_customized_norm(out_channel, norm)
-        self.norm2 = _make_customized_norm(out_channel, norm)
+        self.inplanes = 64
 
-        self.conv1by1 = torch.nn.Conv2d(in_channel, out_channel, kernel_size=1, stride=1 + int(sub))
-        self.use1by1 = (in_channel != out_channel)
-
-    @staticmethod
-    def _make_customized_norm(out_channel, norm):
-        if 'bn' in norm.lower():
-            return torch.nn.BatchNorm2d(out_channel)
-        elif 'gn' in norm.lower():
-            group = norm.split('-')[-1]
-            return torch.nn.GroupNorm(group, out_channel)
-        else:
-            return lambda x: x
-
-    def forward(self, x):
-        y = F.relu(self.norm1(self.conv1(x)))
-        y = self.norm2(self.conv2(y))
-
-        if self.use1by1:
-            x = self.conv1by1(x)
-        y += x
-
-        return F.relu(y)
-
-
-class ResNet(torch.nn.Module):
-    def __init__(self, in_channel, out_channel, norm='bn'):
-        super(ResNet, self).__init__()
         self.in_channel = in_channel
-        self.out_channel = out_channel
-        self.norm = norm
+        self.prototype = status[0]
+        self.pretrained = status[-1]
 
-        self.ResNetLayer = self._construct()
-        self.Norm = self._make_customized_norm(out_channel, norm)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
-    @staticmethod
-    def _make_customized_norm(out_channel, norm):
-        if 'bn' in norm.lower():
-            return torch.nn.BatchNorm2d(out_channel)
-        elif 'gn' in norm.lower():
-            group = norm.split('-')[-1]
-            return torch.nn.GroupNorm(group, out_channel)
+        # Zero-initialize the last BN in each residual branch,
+        # so that the residual branch starts with zeros, and each residual block behaves like an identity.
+        # This improves the model by 0.2~0.3% according to https://arxiv.org/abs/1706.02677
+        if zero_init_residual:
+            for m in self.modules():
+                if isinstance(m, Bottleneck) and m.bn3.weight is not None:
+                    nn.init.constant_(m.bn3.weight, 0)  # type: ignore[arg-type]
+                elif isinstance(m, BasicBlock) and m.bn2.weight is not None:
+                    nn.init.constant_(m.bn2.weight, 0)  # type: ignore[arg-type]
+
+        self._revise_model()
+
+    def _revise_model(self):
+        # Select the prototype to use
+        if self.prototype == 18:
+            self.layers = [2, 2, 2, 2]
+            self.block = BasicBlock
+        elif self.prototype == 34:
+            self.layers = [3, 4, 6, 3]
+            self.block = BasicBlock
+        elif self.prototype == 50:
+            self.layers = [3, 4, 6, 3]
+            self.block = Bottleneck
+        elif self.prototype == 101:
+            self.layers = [3, 4, 23, 3]
+            self.block = Bottleneck
+        elif self.prototype == 152:
+            self.layers = [3, 8, 36, 3]
+            self.block = Bottleneck
         else:
-            return lambda x: x
+            self.layers = [2, 2, 2, 2]
+            self.block = BasicBlock
 
-    def _build_res_blocks(self, in_channel, out_channel, layers, sub=False):
-        asemble_line = []
-
-        for i in range(layers):
-            if i == 0:
-                asemble_line.append(_ResBlock(in_channel, out_channel, sub=sub, norm=self.norm))
-            else:
-                asemble_line.append(_ResBlock(out_channel, out_channel, sub=False, norm=self.norm))
-
-        return asemble_line
-
-    def _construct(self):
-        COMPRESS_L1 = 8192
-        COMPRESS_L2 = 4096
-        COMPRESS_L3 = 1024
-
-        ini_out_channel = 16 * self.in_channel
-        ini_block = Sequential(
-            torch.nn.Conv2d(self.in_channel, ini_out_channel, kernel_size=7, padding=3, stride=2),
-            self._make_customized_norm(out_channel, self.norm),
-            torch.nn.ReLU(),
-            torch.nn.MaxPool2d(kernel_size=3, padding=1, stride=2)
-        )
-
-        resnet = Sequential(
-            ini_block,
-
-            Sequential(*self._build_res_blocks(ini_out_channel, ini_out_channel, 2)),
-            Sequential(*self._build_res_blocks(ini_out_channel, ini_out_channel * 2, 2, sub=True)),
-            Sequential(*self._build_res_blocks(ini_out_channel * 2, ini_out_channel * 4, 2)),
-            Sequential(*self._build_res_blocks(ini_out_channel * 4, ini_out_channel * 8, 2)),
-            Sequential(*self._build_res_blocks(ini_out_channel * 8, ini_out_channel * 16, 2)),
-            torch.nn.AvgPool2d(kernel_size=1),
-            torch.nn.Flatten(),
-
-            torch.nn.Linear(COMPRESS_L1, COMPRESS_L2),
-            self._make_customized_norm(COMPRESS_L2, self.norm),
-            torch.nn.ReLU(),
-
-            torch.nn.Linear(COMPRESS_L2, COMPRESS_L3),
-            self._make_customized_norm(COMPRESS_L3, self.norm),
-            torch.nn.ReLU(),
-
-            torch.nn.Linear(COMPRESS_L3, self.out_channel),
-        )
-
-        return resnet
+        # Revise the accepted input channel size
+        self.conv1 = torch.nn.Conv2d(self.in_channel, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
 
     def forward(self, x):
-        x = self.ResNetLayer(x)
-        x = self.Norm(x)
-        return x
+        return self._forward_impl(x)
 
 
 # RNNs | [Batch, Seq, Dimensions] -> [Batch, Seq, Hidden] or [Batch, Hidden]
@@ -575,155 +551,34 @@ class TransformerSeq2Point(torch.nn.Module):
 
 
 # Hybrid ===============================================================================================================
-# Face1 Model for ResNetTransformer2ResNetRnn
-class ResNet18GRUF1(torch.nn.Module):
-    def __init__(self, resnet_config, rnn_config, linear_out=1, mode='L'):
-        super(ResNet18GRUF1, self).__init__()
-        self.ResNet = ResNet(resnet_config['in_channel'], resnet_config['out_channel'])
-
-        if mode.upper() == 'G':
-            self.Rnn = GRUSeq2Point(rnn_config['in_dim'],
-                                    rnn_config['hidden_dim'],
-                                    rnn_config['num_layers'],
-                                    rnn_config['dropout'])
+# GRU Classification
+class SeqClassification(torch.nn.Module):
+    def __init__(self, in_dim, hidden, out_dim, num_layers, dropout, mode='G'):
+        super(SeqClassification, self).__init__()
+        if mode == 'G':
+            self.Rnn = GRUSeq2Point(in_dims=in_dim,
+                                    hidden_dim=hidden,
+                                    num_layers=num_layers,
+                                    dropout=dropout)
         else:
-            self.Rnn = LSTMSeq2Point(rnn_config['in_dim'],
-                                     rnn_config['hidden_dim'],
-                                     rnn_config['num_layers'],
-                                     rnn_config['dropout'])
+            self.Rnn = LSTMSeq2Point(in_dims=in_dim,
+                                     hidden_dim=hidden,
+                                     num_layers=num_layers,
+                                     dropout=dropout)
 
-        self.BatchNorm = torch.nn.BatchNorm1d(rnn_config['hidden_dim'] + resnet_config['out_channel'])
-        self.Linear1 = torch.nn.Linear(rnn_config['hidden_dim'] + resnet_config['out_channel'],
-                                       2 * rnn_config['hidden_dim'] + resnet_config['out_channel'])
-        self.Linear2 = torch.nn.Linear(2 * rnn_config['hidden_dim'] + resnet_config['out_channel'],
-                                       rnn_config['hidden_dim'])
-        self.Linear3 = torch.nn.Linear(rnn_config['hidden_dim'], linear_out)
+        self.BatchNorm = torch.nn.BatchNorm1d(hidden)
+        self.Linear1 = torch.nn.Linear(hidden, out_dim * 4)
+        self.Linear2 = torch.nn.Linear(out_dim * 4, out_dim * 2)
+        self.Linear3 = torch.nn.Linear(out_dim * 2, out_dim)
 
-    def forward(self, x, s):
-
-        x = self.ResNet(x)                      # (batch_size, out_channel)
-        s = self.Rnn(s)                         # (batch_size, hidden_dim)
-
-        o = torch.concat([x, s], dim=1)  # (batch_size, out_channel + hidden_dim)
-
-        o = self.BatchNorm(o)
-        o = F.relu(self.Linear1(o))
-        o = F.relu(self.Linear2(o))
-        o = self.Linear3(o)
-
-        return o
-
-
-# Face2 Model for ResNetTransformer2ResNetRnn
-class ResNetTransformer(torch.nn.Module):
-    def __init__(self, resnet_config, transformer_config, rnn_config, linear_out=1):
-        super(ResNetTransformer, self).__init__()
-
-        # for seq_cnn preprocessing
-        self.ResNet = ResNet(resnet_config['in_channel'], resnet_config['out_channel'])
-
-        # for seq_cnn and seq_label main
-        self.Transformer = TransformerSeq2Point(
-            {
-                'mode': transformer_config['mode'],
-                'in_dim_enc': transformer_config['in_dim_enc'],
-                'in_dim_dec': transformer_config['in_dim_dec'],
-                'hidden_dim': transformer_config['hidden_dim'],
-                'num_heads': transformer_config['num_heads'],
-                'num_layers_enc': transformer_config['num_layers_enc'],
-                'num_layers_dec': transformer_config['num_layers_dec'],
-                'dropout': transformer_config['dropout']
-            },
-            {
-                'mode': rnn_config['mode'],
-                'hidden_dim': rnn_config['hidden_dim'],
-                'num_layers': rnn_config['num_layers'],
-                'dropout': rnn_config['dropout']
-            }
-        )
-
-        # for squeezing into next label's prediction
-        self.BatchNorm = torch.nn.BatchNorm1d(resnet_config['out_channel'])
-        self.GroupNorm = torch.nn.GroupNorm(3, resnet_config['out_channel'])
-        self.Linear1 = torch.nn.Linear(resnet_config['out_channel'], resnet_config['out_channel'] * 2)
-        self.Linear2 = torch.nn.Linear(resnet_config['out_channel'] * 2, resnet_config['out_channel'] // 2)
-        self.Linear3 = torch.nn.Linear(resnet_config['out_channel'] // 2, linear_out)
-
-    def forward(self, seq_cnn, seq_label):
-        # ResNet
-        with torch.no_grad():
-            batch_size = seq_cnn.shape[0]
-            seq = seq_cnn.shape[1]
-            channel = seq_cnn.shape[2]
-            height = seq_cnn.shape[3]
-            width = seq_cnn.shape[4]
-        seq_cnn = seq_cnn.view(-1, channel, height, width)
-        seq_cnn = self.ResNet(seq_cnn)
-        seq_cnn = seq_cnn.view(batch_size, seq, -1)
-
-        # Transformer
-        o = self.Transformer(seq_cnn, seq_label)
-
-        # FullConnection
-        # o = self.GroupNorm(o)
+    def forward(self, x):
+        o = self.Rnn(x)
         o = self.BatchNorm(o)
 
         o = F.relu(self.Linear1(o))
         o = F.relu(self.Linear2(o))
         o = self.Linear3(o)
-        return o
-
-
-class ResNetTransformer2ResNetRnn(torch.nn.Module):
-    def __init__(self, face1dict, face2dict):
-        super(ResNetTransformer2ResNetRnn, self).__init__()
-
-        self.F1_net = ResNetTransformer(resnet_config=face1dict['resnet_config'],
-                                        transformer_config=face1dict['transformer_config'],
-                                        rnn_config=face1dict['rnn_config'],
-                                        linear_out=20)
-
-        self.F2_net = ResNet18GRUF1(face2dict['resnet_config'],
-                                    face2dict['rnn_config'],
-                                    linear_out=10)
-
-        self.BatchNorm_transformer = torch.nn.BatchNorm1d(20)
-        self.BatchNorm_resnetgru = torch.nn.BatchNorm1d(10)
-
-        # self.GroupNorm_transformer = torch.nn.GroupNorm(4, 20)
-        # self.GroupNorm_resnetgru = torch.nn.GroupNorm(2, 10)
-
-        self.Linear_F2_cat = torch.nn.Linear(20 + 10, 1)
-
-    def forward(self, seq_cnn, cnn, seq_label):
-        o = self.BatchNorm_transformer(self.F1_net(seq_cnn, seq_label))
-        r = self.BatchNorm_resnetgru(self.F2_net(cnn, seq_label))
-
-        o = self.Linear_F2_cat(torch.concat((o, r), dim=-1))
 
         return o
 
-# class ResNetRnn2ResNetTransformer(torch.nn.Module):
-#     def __init__(self, face1dict, face2dict, face=1):
-#         super(ResNetRnn2ResNetTransformer, self).__init__()
-#         self.face = face
 
-#         self.F1_net = ResNet18GRUF1(face1dict['resnet_config'],
-#                                     face1dict['rnn_config'],
-#                                     linear_out=1)
-
-#         self.F2_net = ResNetTransformer(resnet_config=face2dict['resnet_config'],
-#                                         transformer_config=face2dict['transformer_config'],
-#                                         rnn_config=face2dict['rnn_config'],
-#                                         linear_out=1)
-
-#         self.Linear_F2_cat = torch.nn.Linear(2, 1)
-
-#     def forward(self, seq_cnn, cnn, seq_label):
-#         o = self.F1_net(cnn, seq_label)
-
-#         if self.face == 2:
-#             r = self.F2_net(seq_cnn, seq_label)
-#             o = self.Linear_F2_cat(torch.concat((o, r), dim=-1))
-
-#         return o
