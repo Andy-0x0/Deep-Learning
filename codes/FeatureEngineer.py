@@ -11,13 +11,15 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.svm import LinearSVC
 from sklearn.feature_selection import RFECV, RFE
 
+from scipy.stats import spearmanr
+
 
 class ClassificationFeatureEngineer:
     def __init__(self, features, labels):
         self.features = features
         self.labels = labels
 
-    def logistic_selection(self, start=-3, end=3, tops=5, viz=False):
+    def logistic_feature_selection(self, start=-3, end=3, tops=5, viz=False):
         regularizers = np.logspace(start=end, stop=start, num=100, base=10)
         tracker = pd.DataFrame()
 
@@ -100,7 +102,7 @@ class ClassificationFeatureEngineer:
             model = LogisticRegression(n_jobs=model_parallel)
         elif model == 'ADA':
             title = 'Adaboost Classifier'
-            model = AdaBoostClassifier(estimator=DecisionTreeClassifier(max_depth=3), n_estimators=50, algorithm='SAMME')
+            model = AdaBoostClassifier(estimator=DecisionTreeClassifier(max_depth=5), n_estimators=100, algorithm='SAMME')
         elif model == 'LSVM':
             title = 'LinearSVM Classifier'
             model = LinearSVC(penalty='l1')
@@ -126,41 +128,47 @@ class ClassificationFeatureEngineer:
         for rank, index in enumerate(selected_features):
             print(f'{rank + 1}. {str(feature_names[index])}')
 
-        return selected_features
+        return pd.Series(selected_features, name=f'{title}_ranking')
 
-    def syn_feature_ranking(self, tops=5):
+    def syn_feature_selection(self, tops=5):
         models = ['LR', 'LSVM', 'RF', 'ADA']
-        feature_names = self.features.columns
+        feature_names = self.features.columns.to_list()
 
         # Enumerate on all models
         temps = []
         candidates = set()
         for model in models:
-            temp_features = self.gen_feature_selection(model=model, tops=tops, cv=0)
+            temp_features = self.gen_feature_selection(model=model, tops=tops, cv=0).to_list()
             candidates.update(temp_features)
             temps.append(temp_features)
 
         ranking_dict = {candidate: 0 for candidate in candidates}
-        for temp in temps:
+        individual_df = pd.DataFrame(None, columns=models, index=list(candidates))
+
+        for idx, temp in enumerate(temps):
             losers = candidates - set(temp)
 
             for rank in range(tops):
                 ranking_dict[temp[rank]] += rank
+                individual_df.loc[temp[rank], models[idx]] = rank
             for loser in losers:
                 ranking_dict[loser] += tops
+                individual_df.loc[loser, models[idx]] = tops
 
         # Ranking the features
         selected_features_sr = pd.Series(list(ranking_dict.values()),
                                          index=list(ranking_dict.keys()),
-                                         name='feature_ranking')
+                                         name='synthesized_ranking')
         selected_features_sr = selected_features_sr.sort_values()
 
         # Regularize the Rankings
-        for idx, rank in enumerate(selected_features_sr.values):
-            if selected_features_sr.iloc[idx] == (selected_features_sr.iloc[idx - 1] if idx >= 1 else 0):
-                continue
+        temp_sr = selected_features_sr.copy()
+        for idx, _ in enumerate(selected_features_sr.values):
+            if selected_features_sr.iloc[idx] == selected_features_sr.iloc[idx - 1] and idx >= 1:
+                temp_sr.iloc[idx] = temp_sr.iloc[idx - 1]
             else:
-                selected_features_sr.iloc[idx] = idx
+                temp_sr.iloc[idx] = idx
+        selected_features_sr = temp_sr.copy()
 
         # Convert to a ranking dictionary
         selected_features_dict = {}
@@ -178,31 +186,156 @@ class ClassificationFeatureEngineer:
                 print(f'{str(name)} ', end='')
             print()
 
-        return selected_features_sr
+        return selected_features_sr, individual_df
 
-    def PCA_feature_selection(self, tops=5, viz=True):
-        scaler = StandardScaler()
-        scaler.fit(self.features)
-        scaled_features = scaler.transform(self.features)
+    def PCA_feature_selection(self, tops:int = 5, viz:bool = True) -> tuple[pd.DataFrame, pd.Series]:
+        '''
+        Perform PCA with visualization.
 
-        pca = PCA(n_components=tops)
-        pca.fit(scaled_features)
-
+        :param tops: How many top features to look into for specific weights
+        :param viz: To visualize the results or not
+        :return: Dataframe(specific weights for top features) | Series(variances of all PCs)
+        '''
         feature_names = self.features.columns
+        centered_features = self.features - self.features.mean(axis=0)
+        feature_num = len(self.features.columns)
 
+        # Get the pca with assigned tops & Get all pca with var
+        target_pca = PCA(n_components=tops)
+        target_pca.fit(centered_features)
+
+        var_pca = PCA(n_components=feature_num)
+        var_pca.fit(centered_features)
+        variance_sr = pd.Series(var_pca.explained_variance_ratio_, name='pca_vars', index=[f'PC{i}' for i in range(1, feature_num + 1)])
+        variance_diff = np.abs(np.diff(variance_sr.to_list())).tolist()
+        variance_diff.insert(0, variance_sr.iloc[0])
+
+        # Calculate the Meaningful cutoffs among all PCs
+        cutoff_index = feature_num
+        for idx, diff in enumerate(variance_diff):
+            if diff <= 0.01:
+                cutoff_index = idx
+                break
+
+        weight_df = pd.DataFrame(target_pca.components_.T, index=feature_names, columns=[f"Top{rank + 1}" for rank in range(tops)])
+        PC_idx = [f'IPC{i}' for i in range(1, cutoff_index + 1)] + [f'PC{i}' for i in range(cutoff_index + 1, feature_num + 1)]
+        variance_sr.index = PC_idx
+
+        # Plotting
         if viz:
-            plt.figure(figsize=(16, 9))
-            plt.matshow(pca.components_, cmap='hot')
-            plt.yticks([rank for rank in range(tops)], [f'Top {rank + 1}th component' for rank in range(tops)])
-            plt.colorbar()
-            plt.xticks([fea for fea in range(len(feature_names))], feature_names, rotation=60, ha='left')
+            # Global Plotting Configuration
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 9))
 
-            plt.title('PCA Feature Selection')
-            plt.xlabel("Component Weights")
-            plt.ylabel("Principle Component")
+            # Specific Importance for Given Tops
+            ax1.matshow(target_pca.components_, cmap='hot')
+            ax1.set_yticks([rank for rank in range(tops)])
+            ax1.set_yticklabels([f'PC{rank + 1}' for rank in range(tops)])
+            ax1.set_xticks(np.arange(len(feature_names)))
+            ax1.set_xticklabels(list(feature_names), rotation=60, ha='left')
+            ax1.set_title('PCA Feature Selection')
+            ax1.set_xlabel("Component Weights")
+            ax1.set_ylabel("Principle Component")
+
+            # Plot all Variance ratios of all PCs and the Differences Trends
+            ax2.bar(np.arange(1, cutoff_index + 1), variance_sr.to_list()[: cutoff_index], color='blue', alpha=0.9)
+            ax2.bar(np.arange(cutoff_index + 1, feature_num + 1), variance_sr.to_list()[cutoff_index:], color='gray', alpha=0.5)
+            ax2_twin = ax2.twinx()
+            ax2_twin.plot(np.arange(1, feature_num + 1), variance_diff, color='red', marker='o', linestyle='-', alpha=0.9)
+            ax2.set_xticks(np.arange(1, len(feature_names) + 1))
+            ax2.set_xticklabels(variance_sr.index, rotation=60, ha='left')
+            ax2_twin.grid()
+            ax2_twin.set_ylabel('Variance Diff')
+            ax2.set_title('Variance of PCs')
+            ax2.set_xlabel('PC Indexes')
+            ax2.set_ylabel('Variance(%)')
+
+            # Visualize the Plot
             plt.show()
             plt.close()
 
-        return pd.DataFrame(pca.components_.T, index=feature_names, columns=[f"Top{rank + 1}" for rank in range(tops)])
+        return weight_df, variance_sr
+
+    @staticmethod
+    def scp_feature_restriction(rankings, method='rankIC', agg='mean', viz=False):
+        # choosing the aggregation of restriction
+        def _agg_wrap(ori_list, method=agg):
+            evaluation_collector = np.array(ori_list)
+            if method == 'mean':
+                indicator = evaluation_collector.mean()
+            elif method == 'median':
+                indicator = evaluation_collector.median()
+            elif method == 'sum':
+                indicator = evaluation_collector.sum()
+            elif method == 'max':
+                indicator = evaluation_collector.max()
+            elif method == 'min':
+                indicator = evaluation_collector.min()
+            else:
+                indicator = evaluation_collector.mean()
+
+            return indicator
+
+        # calculate the rankIC of all pairs of the ranking dataframe
+        def rankIC_pairwise(ranks:pd.DataFrame):
+            rankIC_collector = []
+
+            for outer_col in range(len(ranks.columns)):
+                for inner_col in range(outer_col + 1, len(ranks.columns)):
+                    rankIC_collector.append(spearmanr(ranks.iloc[:, outer_col].to_list(), ranks.iloc[:, inner_col].to_list()))
+
+            return _agg_wrap(rankIC_collector, method=agg)
+
+        # calculate the set difference of all pairs of the ranking dataframe
+        def setdiff_pairwise(ranks:pd.Series):
+            setdiff_collector = []
+
+            for outer_row in range(len(ranks.index)):
+                for inner_row in range(outer_col + 1, len(ranks.index)):
+                    setdiff_collector.append(len(set(ranks.iloc[:, outer_row].to_list()) - set(ranks.iloc[:, inner_row].to_list())))
+
+            return _agg_wrap(setdiff_collector, method=agg)
+
+        if isinstance(rankings, list):
+            rankings_collector = []
+
+            for ranking in rankings:
+                # choosing the method of restriction
+                if method.lower() == 'rankic':
+                    indicator = rankIC_pairwise(ranking)
+                elif method.lower() == 'setdiff':
+                    indicator = setdiff_pairwise(pd.Series(set_collector))
+                else:
+                    indicator = setdiff_pairwise(ranking)
+
+                rankings_collector.append(indicator)
+
+            if viz:
+                plt.figure(figsize=(16, 9))
+                plt.title("RankIC vs. Feature Size")
+                plt.xlabel("Feature Size")
+                plt.ylabel("RankIC")
+
+                plt.plot(np.arange(0, len(rankings_collector)), rankings_collector)
+                margin = 0.1 * (max(rankings_collector) - min(rankings_collector))
+                plt.fill_between(np.arange(0, len(rankings_collector)),
+                                 [min(rankings_collector) - margin] * len(rankings_collector),
+                                 rankings_collector,
+                                 alpha=0.2,
+                                 color='blue')
+                plt.show()
+
+            return rankings_collector
+
+        else:
+            res = rankIC_single(rankings)
+            print(f'The rankIC for this ranking dataframe is: {res: .3f}')
+            return res
+
+
+
+
+
+
+
 
 

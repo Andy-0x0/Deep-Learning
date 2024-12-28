@@ -485,100 +485,192 @@ class LSTMSeq2Point(torch.nn.Module):
 
 
 # Transformers | [Batch, Seq, Dimensions] -> [Batch, Seq, Hidden] or [Batch, Hidden]
-# Transformer (Many-to-One) ============================================================================================
-class SinCosPositionalEncoding(torch.nn.Module):
-    def __init__(self, max_seq, hidden, dropout=0.1):
-        super(SinCosPositionalEncoding, self).__init__()
-        self.Dropout = torch.nn.Dropout(dropout)
-        self.Panel = torch.zeros((1, max_seq, hidden))
-        position = (torch.arange(max_seq, dtype=torch.float).reshape(-1, 1) /
-                    torch.pow(10000, torch.arange(0, hidden, 2, dtype=torch.float) / hidden))
-        self.Panel[:, :, 0::2] = torch.sin(position)
-        self.Panel[:, :, 1::2] = torch.cos(position)
+# Transformers ============================================================================================
+# Positional Encoding according to "Attention is All You Need"
+class PositionalEncoding(torch.nn.Module):
+    def __init__(self, max_seq:int = 4096, in_dim:int = 512) -> None:
+        '''
+        initialization
+
+        :param max_seq: A number that guarantees being greater that you inputs' seq dimension
+        :param in_dim: The number of you inputs' feature dimension (dim-0)
+        '''
+        super(PositionalEncoding, self).__init__()
+        # according to "Attention is All You Need" PosEnc sin|cos (pos / 10000^(2i/in_dim))
+        # pos:          dim-1 -> the sequence dimension
+        # i & in_dim:   dim-0 -> the feature(embedding) dimension
+        positional_enc = (torch.arange(max_seq).reshape(-1, 1) / torch.pow(10000, torch.arange(0, in_dim, 2) / in_dim))
+
+        # Apply the positional encoding on the large panel to cover the [Batch, Seq, In_dim] inputs
+        self.Panel = torch.zeros((1, max_seq, in_dim))      # [Batch=1, Max_Seq=4096, In_dim=512]
+        self.Panel[:, :, 0::2] = torch.sin(positional_enc)
+        self.Panel[:, :, 1::2] = torch.cos(positional_enc)
 
     def forward(self, x):
-        x = x + self.Panel[:, :x.shape[1], :].to(x.device)
-        x = self.Dropout(x)
-        return x
+        # cover the input with the larger positional encoding panel, cut the panel to [Batch, Max_seq=seq, In_dim]
+        with torch.no_grad():
+            self.Panel = self.Panel.to(device=x.device)
+            x = x + self.Panel[:, :x.shape[1], :]
+            return x
 
 
-class TransformerSeq2Point(torch.nn.Module):
-    def __init__(self, transformer_config, output_config):
-        super(TransformerSeq2Point, self).__init__()
+# Smart Embedding that can change the mode based on time series / discrete instances i.e. words
+class AdaEmbedding(torch.nn.Module):
+    def __init__(self, mode:str = 'ts', vocab_dim:int = 10000, embedding_dim:int = 512) -> None:
+        '''
+        Initialization
 
-        # Inside a Transformer
-        if transformer_config['mode'] == 'ts':
-            self.EmbeddingEnc = torch.nn.Linear(transformer_config['in_dim_enc'], transformer_config['hidden_dim'])
-            self.EmbeddingDec = torch.nn.Linear(transformer_config['in_dim_dec'], transformer_config['hidden_dim'])
+        :param mode: The mode for embedding a time series 'ts' or embedding a discrete instance 'di'
+        :param vocab_dim: The total vocabulary size if in 'di' mode
+                          The original feature size if in 'ts' mode
+        :param embedding_dim: The embedding dimension to embed the discrete instance if in 'di' mode
+                              The original input feature dimension of the time series if in 'ts' mode
+        '''
+        super(AdaEmbedding, self).__init__()
+        # No embedding if mode == 'ts'
+        if mode == 'ts':
+            self.embedding = torch.nn.Linear(vocab_dim, embedding_dim)
+
+        # embedding as arranged if mode == 'di'
+        elif mode == 'di':
+            self.embedding = torch.nn.Embedding(vocab_dim, embedding_dim)
+
+    def forward(self, x):
+        return self.embedding(x)
+
+
+# Smart Transformer for Classification usage
+class Transformer(torch.nn.Module):
+    def __init__(
+        self,
+        mode:tuple[str, str] = ('ts', 'di'),
+        vocab_dim:tuple[int, int] = (128, 2),
+        embedding_dim:int|str = 'auto',
+        positional_dim:int = 4096,
+        head_num:int = 8,
+        encoder_num:int = 6,
+        decoder_num:int = 6,
+        dropout:float = 0.1,
+        batch_first:bool = True,
+        aft_mode: str = 'G',
+        aft_hidden_lay: int = 5,
+        aft_hidden_dim:int = 128
+    ) -> None:
+        '''
+        Initialization
+
+        :param mode: The mode for embedding a time series 'ts' or embedding a discrete instance 'di'
+        :param vocab_dim: The total vocabulary size if in 'di' mode
+                          The original feature size if in 'ts' mode
+        :param embedding_dim: The embedding dimension to embed the discrete instance if in 'di' mode, 'auto' for automatically decidsion
+                              The original input feature dimension of the time series if in 'ts' mode, 'auto' for automatically decidsion
+        :param positional_dim: A number that guarantees being greater that you inputs' seq dimension
+        :param head_num: The number of the multi-head attention
+        :param encoder_num: The number of the encoder layers
+        :param decoder_num: The number of the decoder layers
+        :param dropout: The rate for dropout
+        :param batch_first: Recognizing the input shape as [Batch, Seq, Embedding_dim]
+        '''
+        super(Transformer, self).__init__()
+
+        self.embedding_dim = None
+
+        # Embedding Layer
+        # Choose the embedding dimension smartly
+        def choose_embedding_dim(dictionary_size):
+            EMB_DIMS = np.array([64, 128, 256, 512, 768, 1024])
+            indicator_dim = np.floor(np.sqrt(dictionary_size))
+
+            attempt_dim = EMB_DIMS - indicator_dim
+            for idx in range(len(attempt_dim)):
+                if attempt_dim[idx] > 0:
+                    return EMB_DIMS[idx]
+
+            return int(indicator_dim)
+
+        if mode == ('ts', 'ts'):
+            # Probably Regression Task: in_dim=d -> out_dim=d
+            # using the in_dim as the "embedding" if auto
+            # using the assigned dim as the "embedding" if int
+            if isinstance(embedding_dim, str) and embedding_dim == 'auto':
+                self.embedding_dim = int(max(vocab_dim))
+            elif isinstance(embedding_dim, (int, float)):
+                self.embedding_dim = int(embedding_dim)
+            self.embedding_enc = AdaEmbedding(mode='ts', vocab_dim=vocab_dim[0], embedding_dim=self.embedding_dim)
+            self.embedding_dec = AdaEmbedding(mode='ts', vocab_dim=vocab_dim[1], embedding_dim=self.embedding_dim)
+
+        elif mode == ('ts', 'di'):
+            # Probably Classification Task: in_dim=d -> out_dim=l
+            # using the maximum of in_dim and smart(out_dim) as the "embedding" if auto
+            # using the assigned dim as the "embedding" if int
+            if isinstance(embedding_dim, str) and embedding_dim == 'auto':
+                self.embedding_dim = int(max(vocab_dim[0], choose_embedding_dim(vocab_dim[1])))
+            elif isinstance(embedding_dim, (int, float)):
+                self.embedding_dim = int(embedding_dim)
+            self.embedding_enc = AdaEmbedding(mode='ts', vocab_dim=vocab_dim[0], embedding_dim=self.embedding_dim)
+            self.embedding_dec = AdaEmbedding(mode='di', vocab_dim=vocab_dim[1], embedding_dim=self.embedding_dim)
+
+        elif mode == ('di', 'ts'):
+            # Probably Rating Task: in_dim=l -> out_dim=d
+            # using the maximum of smart(in_dim) and out_dim as the "embedding" if auto
+            # using the assigned dim as the "embedding" if int
+            if isinstance(embedding_dim, str) and embedding_dim == 'auto':
+                self.embedding_dim = int(max(choose_embedding_dim(vocab_dim[0]), vocab_dim[1]))
+            elif isinstance(embedding_dim, (int, float)):
+                self.embedding_dim = int(embedding_dim)
+            self.embedding_enc = AdaEmbedding(mode='di', vocab_dim=vocab_dim[0], embedding_dim=self.embedding_dim)
+            self.embedding_dec = AdaEmbedding(mode='ts', vocab_dim=vocab_dim[1], embedding_dim=self.embedding_dim)
+
+        elif mode == ('di', 'di'):
+            # Probably Text Prediction Task: in_dim=l -> out_dim=l
+            # using the maximum of smart(in_dim) and smart(out_dim) as the "embedding" if auto
+            # using the assigned dim as the "embedding" if int
+            if isinstance(embedding_dim, str) and embedding_dim == 'auto':
+                self.embedding_dim = int(max(choose_embedding_dim(vocab_dim[0]), choose_embedding_dim(vocab_dim[1])))
+            elif isinstance(embedding_dim, (int, float)):
+                self.embedding_dim = int(embedding_dim)
+            self.embedding_enc = AdaEmbedding(mode='di', vocab_dim=vocab_dim[0], embedding_dim=self.embedding_dim)
+            self.embedding_dec = AdaEmbedding(mode='di', vocab_dim=vocab_dim[1], embedding_dim=self.embedding_dim)
+
         else:
-            self.EmbeddingEnc = torch.nn.Embedding(transformer_config['in_dim_enc'], transformer_config['hidden_dim'])
-            self.EmbeddingDec = torch.nn.Embedding(transformer_config['in_dim_dec'], transformer_config['hidden_dim'])
-        self.PositionalEncodingEnc = SinCosPositionalEncoding(10000,
-                                                              transformer_config['hidden_dim'],
-                                                              transformer_config['dropout'])
-        self.PositionalEncodingDec = SinCosPositionalEncoding(10000,
-                                                              transformer_config['hidden_dim'],
-                                                              transformer_config['dropout'])
-        self.Transformer = torch.nn.Transformer(d_model=transformer_config['hidden_dim'],
-                                                nhead=transformer_config['num_heads'],
-                                                num_encoder_layers=transformer_config['num_layers_enc'],
-                                                num_decoder_layers=transformer_config['num_layers_dec'],
-                                                dropout=transformer_config['dropout'],
-                                                batch_first=True)
+            raise Exception(f"Unknown mode: '{mode}' for TransformerClassifier!")
 
-        # Outside a Transformer
-        if output_config['mode'].upper() == 'G':
-            self.Rnn = GRUSeq2Point(transformer_config['hidden_dim'],
-                                    output_config['hidden_dim'],
-                                    output_config['num_layers'],
-                                    output_config['dropout'])
+        # Positional Encoding Layer
+        self.positional_enc = PositionalEncoding(positional_dim, self.embedding_dim)
+        self.positional_dec = PositionalEncoding(positional_dim, self.embedding_dim)
+
+        # Encoder-Decoder Layer
+        self.transformer = torch.nn.Transformer(d_model=self.embedding_dim,
+                                                nhead=head_num,
+                                                num_encoder_layers=encoder_num,
+                                                num_decoder_layers=decoder_num,
+                                                dropout=dropout,
+                                                batch_first=batch_first)
+
+        # Afterwards Layer
+        self.batch_norm1 = torch.nn.BatchNorm1d(num_features=self.embedding_dim)
+        self.batch_norm2 = torch.nn.BatchNorm1d(num_features=aft_hidden_dim)
+        if aft_mode == 'G':
+            self.after = GRUSeq2Point(in_dims=self.embedding_dim, hidden_dim=aft_hidden_dim, num_layers=aft_hidden_lay)
         else:
-            self.Rnn = LSTMSeq2Point(transformer_config['hidden_dim'],
-                                     output_config['hidden_dim'],
-                                     output_config['num_layers'],
-                                     output_config['dropout'])
+            self.after = LSTMSeq2Point(in_dims=self.embedding_dim, hidden_dim=aft_hidden_dim, num_layers=aft_hidden_lay)
 
     def forward(self, enc_x, dec_x):
-        enc_x = self.EmbeddingEnc(enc_x)
-        enc_x = self.PositionalEncodingEnc(enc_x)
-        dec_x = self.EmbeddingDec(dec_x)
-        dec_x = self.PositionalEncodingDec(dec_x)
+        enc_x = self.embedding_enc(enc_x)
+        enc_x = self.positional_enc(enc_x)
+        dec_x = self.embedding_dec(dec_x)
+        dec_x = self.positional_dec(dec_x)
 
-        o = self.Transformer(enc_x, dec_x)
-        o = self.Rnn(o)
+        o = self.transformer(enc_x, dec_x)
+
+        o = o.permute(0, 2, 1)
+        o = self.batch_norm1(o)
+        o = o.permute(0, 2, 1)
+
+        o = self.after(o)
+        self.batch_norm2(o)
 
         return o
 
 
 # Hybrid ===============================================================================================================
-# GRU Classification
-class SeqClassification(torch.nn.Module):
-    def __init__(self, in_dim, hidden, out_dim, num_layers, dropout, mode='G'):
-        super(SeqClassification, self).__init__()
-        if mode == 'G':
-            self.Rnn = GRUSeq2Point(in_dims=in_dim,
-                                    hidden_dim=hidden,
-                                    num_layers=num_layers,
-                                    dropout=dropout)
-        else:
-            self.Rnn = LSTMSeq2Point(in_dims=in_dim,
-                                     hidden_dim=hidden,
-                                     num_layers=num_layers,
-                                     dropout=dropout)
-
-        self.BatchNorm = torch.nn.BatchNorm1d(hidden)
-        self.Linear1 = torch.nn.Linear(hidden, out_dim * 4)
-        self.Linear2 = torch.nn.Linear(out_dim * 4, out_dim * 2)
-        self.Linear3 = torch.nn.Linear(out_dim * 2, out_dim)
-
-    def forward(self, x):
-        o = self.Rnn(x)
-        o = self.BatchNorm(o)
-
-        o = F.relu(self.Linear1(o))
-        o = F.relu(self.Linear2(o))
-        o = self.Linear3(o)
-
-        return o
-
-

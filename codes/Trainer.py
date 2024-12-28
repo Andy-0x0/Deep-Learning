@@ -7,85 +7,33 @@ import matplotlib.colors as mcolors
 import torch
 import torch.nn.functional as F
 
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
-'''
-loader_dict:    {
-    train:      dataloader                      ->  the dataloader of train datasets
-    test:       dataloader                      ->  the dataloader of test datasets
-}
-
-loader_dict:    {
-    model:      ModelObj                        ->  the modelObj of training 
-    optim:      optimObj                        ->  the optimObj of training
-    loss:       lossObj                         ->  the lossObj of training
-    epochs:     int                             ->  the epoch number of training
-}
-
-batch_size:     int                             ->  the batch_size for training
-'''
-
-
-class EMA:
-    def __init__(self, history=24, bias=False, path='mtyProject/sscqxhdl_prediction/Models/'):
-        self.model = 0
-        self.decay = 1 - (1 / history)
-        self.bias = bias
-        self.path = path
-
-        self.counter = 0
-        self.shadow = {}
-        self.backup = {}
-
-    def register(self, model):
-        self.model = model
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.detach().clone()
-
-    def step(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                current_v = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data.detach().clone()
-
-                if self.bias:
-                    current_v /= 1 - self.decay ** self.counter
-                    self.counter += 1
-
-                self.shadow[name] = current_v.detach().clone()
-
-    def apply(self, device):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                self.backup[name] = param.data.clone()
-
-                temp = self.shadow[name]
-                temp = temp.to(device=torch.device(device))
-                param.data = temp.detach().clone()
-
-    def revert(self, device):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.backup
-
-                temp = self.backup[name]
-                temp = temp.to(device=torch.device(device))
-                param.data = temp.clone()
-        self.backup = {}
-
-    def store(self):
-        torch.save(self.shadow, self.path + 'New_Model_EMA_shadow.pth')
-        torch.save(self.backup, self.path + 'New_Model_EMA_backup.pth')
-
-    def load(self):
-        self.shadow = torch.load(self.path + 'New_Model_EMA_shadow.pth')
-        self.backup = torch.load(self.path + 'New_Model_EMA_backup.pth')
-
-
+# Training Class (1 face) ==============================================================================================
 class Trainer:
-    def __init__(self, train_dict, loader_dict, EMA_config, mode, path='fd_prediction/', name='New_Model.params'):
+    def __init__(self,
+        train_dict:dict = None,
+        loader_dict:dict = None,
+        mode_dict:dict = None,
+        path:str = 'fd_prediction/New_Model.params'
+    ) -> None:
+        '''
+        Initialization
+
+        :param train_dict:
+                - model: The model object inherent torch.nn.Module
+                - optim: The tuple of representation of the optimizer and its parameters
+                - loss: The loss object inherent torch.nn.Module | selected from torch.nn
+                - epochs: The number of epochs for training
+        :param loader_dict:
+                - train: The training dataloader which is a instance of torch.DataLoader
+                - test: The testing dataloader which is a instance of torch.DataLoader
+        :param mode:
+                - objective: The string representation of regression or classification or neither
+                - indicator: The string representation of the evaluating indicator
+        :param path: The path where the trained model will be located
+        '''
 
         self.modelFunct = train_dict['model']
         self.optimizer = train_dict['optim']
@@ -95,13 +43,10 @@ class Trainer:
         self.train_loader = loader_dict['train']
         self.test_loader = loader_dict['test']
 
-        self.EMA = EMA(history=EMA_config[0], bias=EMA_config[1]) if EMA_config else False
-
-        self.mode = mode['objective']
-        self.indicator = mode['indicator']
+        self.mode = mode_dict['objective']
+        self.indicator = mode_dict['indicator']
 
         self.path = path
-        self.name = name
 
         class Printer:
             def __init__(self, epochs):
@@ -134,14 +79,14 @@ class Trainer:
                 if precision_test or precision_train:
                     print(' -> ', end='')
                     if precision_train and not precision_test:
-                        print(f"[Train {mode['indicator'].title()}]: {precision_train * 100:>6.2f}%", end='')
+                        print(f"[Train {mode_dict['indicator'].title()}]: {precision_train * 100:>6.2f}%", end='')
                         self.train_acc_collector.append(precision_train * 100)
                     elif precision_test and not precision_train:
-                        print(f"[Test {mode['indicator'].title()}]: {precision_test * 100:>6.2f}%", end='')
+                        print(f"[Test {mode_dict['indicator'].title()}]: {precision_test * 100:>6.2f}%", end='')
                         self.test_acc_collector.append(precision_test * 100)
                     else:
-                        print(f"[Train {mode['indicator'].title()}]: {precision_train * 100:>6.2f}% | ", end='')
-                        print(f"[Test {mode['indicator'].title()}]: {precision_test * 100:>6.2f}%", end='')
+                        print(f"[Train {mode_dict['indicator'].title()}]: {precision_train * 100:>6.2f}% | ", end='')
+                        print(f"[Test {mode_dict['indicator'].title()}]: {precision_test * 100:>6.2f}%", end='')
                         self.train_acc_collector.append(precision_train)
                         self.test_acc_collector.append(precision_test)
                 print()
@@ -157,7 +102,6 @@ class Trainer:
 
             def get_test_acc(self):
                 return self.test_acc_collector
-
         self.printer = Printer(self.epochs)
 
     @staticmethod
@@ -178,123 +122,10 @@ class Trainer:
         else:
             self.optimizer = torch.optim.SGD(update_params, lr=lr)
 
-    def train(self):
-        self.modelFunct = self.modelFunct.to(self._device())
-        if self.EMA:
-            self.EMA.register(self.modelFunct)
-            if os.path.isfile(self.EMA.path + 'New_Model_EMA_shadow.pth'):
-                self.EMA.load()
-        self.modelFunct.train()
-        self._construct_optimizer()
-
-        for epoch in range(self.epochs):
-
-            for batch_idx, (x, label) in enumerate(self.train_loader):
-                self.optimizer.zero_grad()
-                label = label.to(self._device())
-
-                if type(x) is tuple or type(x) is list:
-                    x = map(lambda ele: ele.to(self._device()), x)
-                    pred = self.modelFunct(*x)
-                    loss = self.lossFunct(pred, label)
-                else:
-                    x = x.to(self._device())
-                    pred = self.modelFunct(x)
-                    loss = self.lossFunct(pred, label)
-
-                loss.backward()
-                self.optimizer.step()
-                self.printer.update(loss, label)
-
-            if self.EMA: self.EMA.step()
-
-            train_acc = 0
-            test_acc = 0
-            if self.mode == 'regression':
-                train_acc = self._on_test_regression(-1, viz=False, train=True)
-                test_acc = self._on_test_regression(-1, viz=False, train=False)
-            elif self.mode == 'classification':
-                train_acc = self._on_test_classification(-1, viz=False, train=True)
-                test_acc = self._on_test_classification(-1, viz=False, train=False)
-            else:
-                pass
-            self.printer.summarize(epoch, train_acc, test_acc)
-
-        loss_df = pd.DataFrame(self.printer.get_loss(), index=np.arange(1, len(self.printer.get_loss()) + 1), columns=['loss'])
-
-        if self.EMA: self.EMA.apply('cuda')
-        if self.EMA: self.EMA.store()
-
-        torch.save(self.modelFunct.state_dict(), self.path + self.name)
-
-        ax1 = None
-        if self.mode == 'regression':
-            plt.figure(figsize=(28, 12))
-            plt.subplot(122)
-            self._on_test_regression(200, viz=True, train=True)
-
-            ax1 = plt.subplot(121)
-            loss_df.loc[:, 'train_acc'] = self.printer.get_train_acc()
-            loss_df.loc[:, 'test_acc'] = self.printer.get_test_acc()
-
-        elif self.mode == 'classification':
-            plt.figure(figsize=(28, 12))
-            plt.subplot(122)
-            self._on_test_classification(200, viz=True, train=True)
-
-            ax1 = plt.subplot(121)
-            loss_df.loc[:, 'train_acc'] = self.printer.get_train_acc()
-            loss_df.loc[:, 'test_acc'] = self.printer.get_test_acc()
-
-        else:
-            plt.figure(figsize=(16, 9))
-            pass
-
-        loss_df.plot(y='loss',
-                     kind='line',
-                     lw=0.9,
-                     ax=ax1,
-                     color='red',
-                     label='Loss')
-        ax1.set_xlabel('Epochs (Batches)')
-        ax1.set_ylabel('Loss Values')
-        ax1.set_title('Training Summary')
-        ax1.fill_between(np.arange(1, 1 + len(loss_df)),
-                         loss_df['loss'].to_list(),
-                         np.zeros(len(loss_df)), color='red',
-                         alpha=0.2)
-        ax1.legend(loc='upper left')
-
-        if self.mode == 'classification' or self.mode == 'regression':
-            ax2 = ax1.twinx()
-            loss_df.plot(y=['train_acc', 'test_acc'],
-                         kind='line',
-                         lw=0.9,
-                         ax=ax2,
-                         color=['green', 'blue'],
-                         label=['Train Accuracy', 'Test Accuracy'])
-            ax2.set_ylabel('Accuracy')
-            ax2.fill_between(np.arange(1, 1 + len(loss_df)),
-                             loss_df['train_acc'].to_list(),
-                             loss_df['test_acc'].to_list(), color='green',
-                             alpha=0.1)
-            ax2.fill_between(np.arange(1, 1 + len(loss_df)),
-                             loss_df['test_acc'].to_list(),
-                             np.zeros(len(loss_df)), color='blue',
-                             alpha=0.1)
-            ax2.legend(loc='upper right')
-
-        plt.show()
-        plt.close()
-
-        print('>>>[Trainer]: Done!')
-        return self.modelFunct, self.path + self.name
-
     def _on_test_regression(self, clip=200, viz=True, train=True):
         pred_collector = []
         label_collector = []
         self.modelFunct = self.modelFunct.to(device=torch.device('cpu'))
-        if self.EMA: self.EMA.apply(device='cpu')
         self.modelFunct.eval()
 
         for idx, (data, label) in enumerate(self.train_loader if train else self.test_loader):
@@ -319,20 +150,32 @@ class Trainer:
             if 0 <= clip <= len(label_collector):
                 break
 
-        res = pd.DataFrame({'Prediction': pred_collector, 'Label': label_collector})
+        if clip >= 0:
+            res = pd.DataFrame({'Prediction': pred_collector, 'Label': label_collector}).iloc[:clip, :]
+        else:
+            res = pd.DataFrame({'Prediction': pred_collector, 'Label': label_collector})
 
-        res.plot(kind='line',
-                 alpha=0.8,
-                 lw=0.8,
-                 xlabel='Samples',
-                 ylabel='Values',
-                 title='Fit on Training Data',
-                 color=('red', 'blue'))
+        if self.indicator.lower().startswith('r'):
+            indicator = r2_score(res.loc[:, 'Label'], res.loc[:, 'Prediction'])
+        elif self.indicator.lower().startswith('l1') or self.indicator.lower().startswith('mse'):
+            indicator = mean_absolute_error(res.loc[:, 'Label'], res.loc[:, 'Prediction'])
+        elif self.indicator.lower().startswith('l2') or self.indicator.lower().startswith('mae'):
+            indicator = mean_squared_error(res.loc[:, 'Label'], res.loc[:, 'Prediction'])
+        else:
+            indicator = r2_score(res.loc[:, 'Label'], res.loc[:, 'Prediction'])
 
-        if self.EMA: self.EMA.revert(device='cpu')
+        if viz:
+            plt.title("Fitting on Training Data")
+            plt.plot(np.arange(1, len(res) + 1), res.loc[:, 'Prediction'], label='Prediction', color='r', alpha=0.8, lw=0.8)
+            plt.plot(np.arange(1, len(res) + 1), res.loc[:, 'Label'], label='Real', color='b', alpha=0.8, lw=0.8)
+            plt.legend(loc='upper right')
+            plt.xlabel('Samples')
+            plt.ylabel('Values')
+
+        # Restore the Environment when leaving
+        self.modelFunct = self.modelFunct.to(device=self._device())
         self.modelFunct.train()
-
-        return 0
+        return indicator
 
     def _on_test_classification(self, clip=200, viz=True, train=True):
         '''
@@ -343,7 +186,6 @@ class Trainer:
         pred_collector = []
         label_collector = []
         self.modelFunct = self.modelFunct.to(device=torch.device('cpu'))
-        if self.EMA: self.EMA.apply(device='cpu')
         self.modelFunct.eval()
 
         for idx, (data, label) in enumerate(self.train_loader if train else self.test_loader):
@@ -435,72 +277,126 @@ class Trainer:
             im, cbar = heatmap(match_map, cbar_label="Matching status")
             annotate_heatmap(im)
 
-        if self.EMA: self.EMA.revert(device='cpu')
         self.modelFunct = self.modelFunct.to(self._device())
         self.modelFunct.train()
 
         return indicator
 
-
-class Trainer2F:
-    def __init__(self, f1_config, f2_config, loader, EMA_config, mode='single', path='fd_prediction/',
-                 name='New_Model.params'):
-
-        self.F1_modelFunct = f1_config['model']
-        self.F1_optimizer = f1_config['optim']
-        self.F1_lossFunct = f1_config['loss']
-        self.F1_epochs = f1_config['epochs']
-
-        self.F2_modelFunct = f2_config['model']
-        self.F2_optimizer = f2_config['optim']
-        self.F2_lossFunct = f2_config['loss']
-        self.F2_epochs = f2_config['epochs']
-
-        self.loader = loader
-        self.EMA_config = EMA_config
-        self.mode = mode
-        self.path = path
-        self.name = name
-
     def train(self):
-        if self.EMA_config:
-            pre_EMA_file = [self.path + 'New_Model_EMA_shadow.pth', self.path + 'New_Model_EMA_backup.pth']
-            if os.path.isfile(pre_EMA_file[0]):
-                os.remove(pre_EMA_file[0])
-            if os.path.isfile(pre_EMA_file[1]):
-                os.remove(pre_EMA_file[1])
+        # 1. Set the model into "training on device mode"
+        self.modelFunct = self.modelFunct.to(device=self._device())
+        self.modelFunct.train()
 
-        trainer = Trainer({
-            'model': self.F1_modelFunct,
-            'loss': self.F1_lossFunct,
-            'optim': self.F1_optimizer,
-            'epochs': self.F1_epochs,
-        },
-            loader=self.loader,
-            EMA_config=self.EMA_config,
-            mode=self.mode,
-            path=self.path,
-            name=self.name)
-        _, state_dict_path = trainer.train()
-        print('>>>[Trainer]: Model Face1 Done!')
+        # 2. Set the optimizer
+        self._construct_optimizer()
 
-        self.F2_modelFunct.load_state_dict(torch.load(state_dict_path))
-        for name, param in self.F2_modelFunct.named_parameters():
-            if 'F1' in name:
-                param.requires_grad = False
+        # Training process starts -------------------------------------------
+        for epoch in range(self.epochs):
 
-        trainer = Trainer({
-            'model': self.F2_modelFunct,
-            'loss': self.F2_lossFunct,
-            'optim': self.F2_optimizer,
-            'epochs': self.F2_epochs,
-        },
-            loader=self.loader,
-            EMA_config=self.EMA_config,
-            mode=self.mode,
-            path=self.path,
-            name=self.name)
-        model_prototype, state_dict_path = trainer.train()
-        print('>>>[Trainer]: Model Face2 Done!')
+            # 3.1 Training the model and do the update
+            for batch_idx, (x, label) in enumerate(self.train_loader):
+                self.optimizer.zero_grad()
+                label = label.to(self._device())
 
-        return model_prototype, state_dict_path
+                # Flexible unzip input x into the model and calculate the loss
+                if type(x) is tuple or type(x) is list:
+                    x = list(map(lambda ele: ele.to(self._device()), x))
+                    pred = self.modelFunct(*x)
+                    loss = self.lossFunct(pred, label)
+                else:
+                    x = x.to(self._device())
+                    pred = self.modelFunct(x)
+                    loss = self.lossFunct(pred, label)
+
+                loss.backward()
+                self.optimizer.step()
+                self.printer.update(loss, label)
+
+            # 3.2 Print the update per epoch
+            if self.mode == 'regression':
+                train_acc = self._on_test_regression(-1, viz=False, train=True)
+                test_acc = self._on_test_regression(-1, viz=False, train=False)
+                self.printer.summarize(epoch, train_acc, test_acc)
+            elif self.mode == 'classification':
+                train_acc = self._on_test_classification(-1, viz=False, train=True)
+                test_acc = self._on_test_classification(-1, viz=False, train=False)
+                self.printer.summarize(epoch, train_acc, test_acc)
+            else:
+                self.printer.summarize(epoch)
+        # Training process ends -------------------------------------------
+
+        # Visualization starts --------------------------------------------
+        # 4. Plot the left
+        def syn_plot(ax):
+            if isinstance(ax, plt.Axes):
+                # Plot the accuracy indicator which only "classification" and "Regression" have
+                ax_copy = ax.twinx()
+                loss_df.plot(y=['train_acc', 'test_acc'],
+                             kind='line',
+                             lw=0.9,
+                             ax=ax_copy,
+                             color=['green', 'blue'],
+                             label=['Train Accuracy', 'Test Accuracy'])
+                ax_copy.fill_between(np.arange(1, 1 + len(loss_df)),
+                                     loss_df['train_acc'].to_list(),
+                                     loss_df['test_acc'].to_list(),
+                                     color='green',
+                                     alpha=0.1)
+                ax_copy.fill_between(np.arange(1, 1 + len(loss_df)),
+                                     loss_df['test_acc'].to_list(),
+                                     np.zeros(len(loss_df)),
+                                     color='blue',
+                                     alpha=0.1)
+                ax_copy.set_ylabel('Accuracy')
+                ax_copy.legend(loc='upper right')
+            else:
+                ax = plt
+            # Plot the loss which all categories have
+            loss_df.plot(y='loss', kind='line', lw=0.9, ax=ax, color='red', label='Loss')
+            ax.fill_between(np.arange(1, 1 + len(loss_df)), loss_df['loss'].to_list(), np.zeros(len(loss_df)),
+                            color='red', alpha=0.2)
+            ax.legend(loc='upper left')
+            ax.set_xlabel('Epochs (Batches)')
+            ax.set_ylabel('Loss Values')
+            ax.set_title('Training Summary')
+
+        loss_df = pd.DataFrame(self.printer.get_loss(), index=np.arange(1, len(self.printer.get_loss()) + 1), columns=['loss'])
+
+        if self.mode == 'regression':
+            plt.figure(figsize=(28, 12))
+
+            plt.subplot(122)
+            self._on_test_regression(200, viz=True, train=True)
+
+            ax1 = plt.subplot(121)
+            loss_df.loc[:, 'train_acc'] = self.printer.get_train_acc()
+            loss_df.loc[:, 'test_acc'] = self.printer.get_test_acc()
+            syn_plot(ax1)
+
+        elif self.mode == 'classification':
+            plt.figure(figsize=(28, 12))
+            plt.subplot(122)
+            self._on_test_classification(200, viz=True, train=True)
+
+            ax1 = plt.subplot(121)
+            loss_df.loc[:, 'train_acc'] = self.printer.get_train_acc()
+            loss_df.loc[:, 'test_acc'] = self.printer.get_test_acc()
+            syn_plot(ax1)
+
+        else:
+            plt.figure(figsize=(16, 9))
+            syn_plot(None)
+
+        plt.show()
+        plt.close()
+        # Visualization ends --------------------------------------------
+
+        torch.save(self.modelFunct.state_dict(), self.path)
+        print('>>>[Trainer]: Done!')
+
+        return self.modelFunct, self.path
+
+
+
+
+
